@@ -1,0 +1,26 @@
+# API credentials
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local database
+*.db
+*.sqlite3
+
+# Generated images and uploads
+media/
+
+# React
+node_modules/
+dist/
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
