@@ -5,6 +5,8 @@ import base64
 import logging
 import os
 import sqlite3
+import time
+import random
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +26,24 @@ from pydantic import BaseModel, Field, field_validator, ConfigDict
 load_dotenv(Path(__file__).with_name('.env'))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('marketmind')
+def gemini_generate_with_retry(client, *, model, contents, config):
+    """Retry transient Gemini overloads only; do not retry invalid input/quota errors."""
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            return client.models.generate_content(model=model, contents=contents, config=config)
+        except Exception as exc:
+            code = getattr(exc, 'code', None) or getattr(exc, 'status_code', None)
+            message = str(exc).lower()
+            transient = (code in (500, 502, 503, 504) or
+                         any(marker in message for marker in ('503 unavailable', '502 bad gateway', '504 deadline_exceeded', '500 internal')))
+            if not transient or attempt == max_attempts - 1:
+                raise
+            delay = min(2 ** attempt * 2, 8) + random.uniform(0, 0.6)
+            logger.warning('Gemini transient failure (attempt %s/%s), retrying in %.1fs', attempt + 1, max_attempts, delay)
+            time.sleep(delay)
+
+
 app = FastAPI(title='MarketMind AI', version='3.0.0')
 app.add_middleware(CORSMiddleware, allow_origins=[os.getenv('FRONTEND_ORIGIN','http://localhost:5173')], allow_credentials=False, allow_methods=['GET','POST'], allow_headers=['Content-Type'])
 DB_PATH = Path(os.getenv('DATABASE_PATH', 'marketmind.db'))
@@ -104,7 +124,7 @@ def generate_strategy(brief:Brief):
     try:
         client = genai.Client(api_key=key)
         try:
-            response = client.models.generate_content(
+            response = gemini_generate_with_retry(client, 
                 model=os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'),
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -274,27 +294,49 @@ def generate_content(payload:ContentRequest):
                       'previous_variations_to_avoid': [x.content for x in previous.variations]},ensure_ascii=False)
     )
     try:
-        # Keep a strong reference to the Gemini client for the entire request.
+        # Validate both JSON shape and exact variation count before saving.
+        # A successful 200 response can still contain fewer items than requested.
         client = genai.Client(api_key=key)
         try:
-            response = client.models.generate_content(
-                model=os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'),
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type='application/json',
-                    response_schema=Batch,
-                    temperature=0.65,
-                    max_output_tokens=4096,
-                ),
-            )
+            parsed = None
+            validation_problem = None
+            for attempt in range(3):
+                strict_prompt = prompt
+                if attempt:
+                    strict_prompt += (
+                        f"\n\nVALIDATION RETRY {attempt}: Previous output was incomplete: "
+                        f"{validation_problem}. Return exactly {payload.count} separate, fully "
+                        "populated objects inside variations. Do not return fewer or more."
+                    )
+                response = gemini_generate_with_retry(
+                    client,
+                    model=os.getenv('GEMINI_MODEL', 'gemini-2.5-flash'),
+                    contents=strict_prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type='application/json',
+                        response_schema=Batch,
+                        temperature=0.45 if attempt else 0.65,
+                        max_output_tokens=8192,
+                    ),
+                )
+                if not response.text:
+                    validation_problem = 'Empty LLM response'
+                else:
+                    try:
+                        candidate = Batch.model_validate_json(response.text)
+                        received = len(candidate.variations)
+                        if received == payload.count:
+                            parsed = candidate
+                            break
+                        validation_problem = f'Expected {payload.count} variations but received {received}'
+                    except Exception as exc:
+                        validation_problem = f'Invalid structured response: {type(exc).__name__}'
+                logger.warning('Gemini structured content attempt %s/3 failed validation: %s',
+                               attempt + 1, validation_problem)
+            if parsed is None:
+                raise ValueError('Wrong number of generated variations or invalid structured content after 3 attempts')
         finally:
             client.close()
-
-        if not response.text:
-            raise ValueError('Empty LLM response')
-        parsed = Batch.model_validate_json(response.text)
-        if len(parsed.variations) != payload.count:
-            raise ValueError('Wrong number of generated variations')
     except Exception as exc:
         logger.exception('Phase 2 content generation failed')
         reason = str(exc).lower()
@@ -535,7 +577,7 @@ def generate_creative_concepts(payload:CreativeConceptRequest):
     try:
         client=genai.Client(api_key=api_key)
         try:
-            response=client.models.generate_content(model=os.getenv('GEMINI_MODEL','gemini-2.5-flash'),contents=prompt,config=types.GenerateContentConfig(response_mime_type='application/json',response_schema=ConceptBatch,temperature=0.75,max_output_tokens=3200))
+            response=gemini_generate_with_retry(client, model=os.getenv('GEMINI_MODEL','gemini-2.5-flash'),contents=prompt,config=types.GenerateContentConfig(response_mime_type='application/json',response_schema=ConceptBatch,temperature=0.75,max_output_tokens=3200))
         finally:
             client.close()
         if not response.text:
@@ -587,7 +629,7 @@ def generate_creative_image(payload:CreativeImageRequest):
                     contents.append(types.Part.from_bytes(data=path.read_bytes(),mime_type=reference['mime_type']))
             client=genai.Client(api_key=api_key)
             try:
-                response=client.models.generate_content(
+                response=gemini_generate_with_retry(client, 
                     model=os.getenv('GEMINI_IMAGE_MODEL','gemini-2.5-flash-image'),
                     contents=contents,
                     config=types.GenerateContentConfig(response_modalities=['IMAGE','TEXT']),
@@ -654,3 +696,204 @@ def select_creative(campaign_id:int,creative_format:str,payload:PreferredCreativ
         con.execute('UPDATE creative_campaigns SET selected_index=? WHERE campaign_id=? AND creative_format=?',
                     (payload.concept_index,campaign_id,creative_format))
     return fetch_creatives(campaign_id,creative_format)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — orchestration, planning, durable run history and explicit approval
+# ---------------------------------------------------------------------------
+from fastapi import Body
+
+class AgentPlanRequest(BaseModel):
+    campaign_id: int = Field(gt=0)
+
+class AgentRunRequest(BaseModel):
+    campaign_id: int | None = Field(default=None, gt=0)
+    brief: Brief | None = None
+    generate_images: bool = True
+    image_count: int = Field(default=1, ge=1, le=3)
+
+class AgentRegenerateRequest(BaseModel):
+    campaign_id: int = Field(gt=0)
+    level: Literal['strategy','caption','image','complete']
+    platform: Literal['Instagram','Instagram Stories','LinkedIn','Facebook','YouTube'] | None = None
+    creative_format: Literal['Instagram Post','Instagram Story','LinkedIn Creative','Facebook Ad','YouTube Thumbnail'] | None = None
+    concept_index: int = Field(default=1, ge=1, le=3)
+    instructions: str = Field(default='', max_length=500)
+
+
+def init_agent_tables():
+    with get_db() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS agent_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id INTEGER,
+            status TEXT NOT NULL,
+            plan_json TEXT NOT NULL DEFAULT '{}',
+            progress_json TEXT NOT NULL DEFAULT '[]',
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
+init_agent_tables()
+
+
+def campaign_plan(campaign: SavedCampaign):
+    platform = campaign.brief.platform
+    presets = {
+        'Instagram': [('Instagram','Instagram Post'),('Instagram Stories','Instagram Story')],
+        'LinkedIn': [('LinkedIn','LinkedIn Creative')],
+        'Facebook': [('Facebook','Facebook Ad')],
+        'YouTube': [('YouTube','YouTube Thumbnail')],
+    }
+    items = [{'platform':p,'creative_format':fmt,'copy_variations':3,
+              'visual_concepts':3,'recommended_images':1} for p,fmt in presets[platform]]
+    return {'campaign_id':campaign.id, 'objective':campaign.brief.campaign_objective,
+            'main_message':campaign.strategy.key_message,
+            'selected_platform':platform, 'items':items,
+            'publishing_requires_approval':True,
+            'notes':'Drafts only. The agent never posts to social networks.'}
+
+@app.get('/api/agent/campaigns/{campaign_id}/plan')
+def get_agent_plan(campaign_id:int):
+    return campaign_plan(load_campaign_or_404(campaign_id))
+
+@app.get('/api/agent/campaigns/{campaign_id}/runs')
+def agent_history(campaign_id:int):
+    load_campaign_or_404(campaign_id)
+    with get_db() as con:
+        rows=con.execute('SELECT * FROM agent_runs WHERE campaign_id=? ORDER BY id DESC LIMIT 15',(campaign_id,)).fetchall()
+    return [dict(id=r['id'],campaign_id=r['campaign_id'],status=r['status'],
+                 plan=json.loads(r['plan_json']),steps=json.loads(r['progress_json']),
+                 error=r['error'],created_at=r['created_at']) for r in rows]
+
+
+def _agent_step(run_id, steps, label, status, detail=''):
+    steps.append({'step':label,'status':status,'detail':detail})
+    with get_db() as con:
+        con.execute('UPDATE agent_runs SET progress_json=?, updated_at=? WHERE id=?',
+                    (json.dumps(steps),datetime.now(timezone.utc).isoformat(),run_id))
+
+
+def _agent_run_for_campaign(campaign_id, generate_images=True, image_count=1, resume_run_id=None):
+    campaign = load_campaign_or_404(campaign_id)
+    plan = campaign_plan(campaign)
+    stamp = datetime.now(timezone.utc).isoformat()
+    with get_db() as con:
+        if resume_run_id is None:
+            cur = con.execute('INSERT INTO agent_runs(campaign_id,status,plan_json,created_at,updated_at) VALUES(?,?,?,?,?)',
+                              (campaign_id,'running',json.dumps(plan),stamp,stamp))
+            run_id = cur.lastrowid
+            steps = []
+        else:
+            row = con.execute('SELECT * FROM agent_runs WHERE id=? AND campaign_id=?',
+                              (resume_run_id, campaign_id)).fetchone()
+            if row is None:
+                raise HTTPException(404, 'Automation run not found for this campaign.')
+            if row['status'] != 'partial':
+                raise HTTPException(409, 'Only partial automation runs can be resumed.')
+            # Never re-run completed steps, even if previous requests changed current UI selection.
+            steps = [item for item in json.loads(row['progress_json']) if item.get('status') == 'completed']
+            run_id = resume_run_id
+            con.execute('UPDATE agent_runs SET status=?, error=NULL, progress_json=?, updated_at=? WHERE id=?',
+                        ('running', json.dumps(steps), stamp, run_id))
+    done = {item['step'] for item in steps if item['status'] == 'completed'}
+    def step_once(label, action, detail):
+        if label not in done:
+            action()
+            _agent_step(run_id, steps, label, 'completed', detail)
+            done.add(label)
+
+    try:
+        step_once('Marketing strategy', lambda: None, 'Using saved structured strategy')
+        step_once('Campaign planner', lambda: None, f"{len(plan['items'])} content formats planned")
+        for item in plan['items']:
+            p = item['platform']
+            fmt = item['creative_format']
+            step_once(f'{p} copy',
+                      lambda p=p: generate_content(ContentRequest(campaign_id=campaign_id, platform=p, count=3)),
+                      'Three structured variations saved')
+            step_once(f'{fmt} concepts',
+                      lambda fmt=fmt: generate_creative_concepts(CreativeConceptRequest(campaign_id=campaign_id, creative_format=fmt)),
+                      'Three prompts saved')
+            if generate_images:
+                for index in range(1, image_count + 1):
+                    step_once(f'{fmt} image {index}',
+                              lambda fmt=fmt, index=index: generate_creative_image(CreativeImageRequest(
+                                  campaign_id=campaign_id, creative_format=fmt, concept_index=index)),
+                              'Creative saved locally')
+        status = 'completed'
+        error = None
+    except Exception as exc:
+        status = 'partial'
+        error = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        _agent_step(run_id, steps, 'Workflow interrupted', 'failed', str(error)[:350])
+        logger.warning('Agent run %s partially completed: %s', run_id, error)
+    with get_db() as con:
+        con.execute('UPDATE agent_runs SET status=?,error=?,updated_at=? WHERE id=?',
+                    (status, error, datetime.now(timezone.utc).isoformat(), run_id))
+    return {'run_id': run_id, 'campaign_id': campaign_id, 'status': status,
+            'plan': plan, 'steps': steps, 'error': error,
+            'approval_required': True, 'published': False}
+
+
+class AgentResumeRequest(BaseModel):
+    run_id: int = Field(gt=0)
+    generate_images: bool = True
+    image_count: int = Field(default=1, ge=1, le=3)
+
+
+@app.post('/api/agent/resume')
+def resume_marketing_agent(payload: AgentResumeRequest):
+    with get_db() as con:
+        row = con.execute('SELECT campaign_id FROM agent_runs WHERE id=?', (payload.run_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, 'Automation run not found.')
+    return _agent_run_for_campaign(row['campaign_id'], payload.generate_images,
+                                   payload.image_count, resume_run_id=payload.run_id)
+
+
+@app.post('/api/agent/run')
+def run_marketing_agent(payload: AgentRunRequest):
+    if payload.brief is None and payload.campaign_id is None:
+        raise HTTPException(422,'Provide a saved campaign_id or a new campaign brief.')
+    if payload.brief is not None and payload.campaign_id is not None:
+        raise HTTPException(422,'Provide either a brief or a campaign_id, not both.')
+    if payload.brief is not None:
+        # This step always creates the strategy before any copy or creatives.
+        new_campaign=generate_strategy(payload.brief)
+        return _agent_run_for_campaign(new_campaign.id,payload.generate_images,payload.image_count)
+    return _agent_run_for_campaign(payload.campaign_id,payload.generate_images,payload.image_count)
+
+@app.post('/api/agent/regenerate')
+def agent_regenerate(payload: AgentRegenerateRequest):
+    campaign=load_campaign_or_404(payload.campaign_id)
+    if payload.level=='complete':
+        return _agent_run_for_campaign(payload.campaign_id,True,1)
+    if payload.level=='caption':
+        p=payload.platform or campaign.brief.platform
+        result=generate_content(ContentRequest(campaign_id=campaign.id,platform=p,count=3))
+        return {'level':'caption','campaign_id':campaign.id,'result':result.model_dump()}
+    if payload.level=='image':
+        fmt=payload.creative_format or campaign_plan(campaign)['items'][0]['creative_format']
+        result=generate_creative_image(CreativeImageRequest(campaign_id=campaign.id,
+                        creative_format=fmt,concept_index=payload.concept_index,instructions=payload.instructions))
+        return {'level':'image','campaign_id':campaign.id,'result':result}
+    # Preserve the campaign's ID, content, and historical drafts; replace strategy
+    # only after Gemini succeeds. Existing generated assets are then explicitly stale.
+    key=os.getenv('GEMINI_API_KEY','').strip()
+    if not key: raise HTTPException(503,'Gemini API key not configured.')
+    prompt=('Create a fresh, fact-grounded marketing STRATEGY, not social media copy. '
+            'Use the brief and follow the selected tone and language. '
+            'Do not invent product facts or discounts.\n'+json.dumps(campaign.brief.model_dump(),ensure_ascii=False))
+    try:
+        client=genai.Client(api_key=key)
+        try:
+            response=gemini_generate_with_retry(client, model=os.getenv('GEMINI_MODEL','gemini-3.8-flash'),
+                contents=prompt,config=types.GenerateContentConfig(response_mime_type='application/json',response_schema=Strategy))
+        finally:client.close()
+        refreshed=Strategy.model_validate_json(response.text)
+    except Exception as exc:
+        raise creative_error(exc) from exc
+    with get_db() as con:
+        con.execute('UPDATE campaigns SET strategy_json=? WHERE id=?',(refreshed.model_dump_json(),campaign.id))
+    return {'level':'strategy','campaign_id':campaign.id,'strategy':refreshed.model_dump(),
+            'notice':'Older copy/images remain saved as historical drafts, but must be regenerated to match the new strategy.'}
