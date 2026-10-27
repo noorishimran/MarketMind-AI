@@ -7,6 +7,10 @@ import os
 import sqlite3
 import time
 import random
+import threading
+from collections import Counter
+from fastapi import Request
+from fastapi.responses import JSONResponse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,24 +31,90 @@ load_dotenv(Path(__file__).with_name('.env'))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('marketmind')
 def gemini_generate_with_retry(client, *, model, contents, config):
-    """Retry transient Gemini overloads only; do not retry invalid input/quota errors."""
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        try:
-            return client.models.generate_content(model=model, contents=contents, config=config)
-        except Exception as exc:
-            code = getattr(exc, 'code', None) or getattr(exc, 'status_code', None)
-            message = str(exc).lower()
-            transient = (code in (500, 502, 503, 504) or
-                         any(marker in message for marker in ('503 unavailable', '502 bad gateway', '504 deadline_exceeded', '500 internal')))
-            if not transient or attempt == max_attempts - 1:
-                raise
-            delay = min(2 ** attempt * 2, 8) + random.uniform(0, 0.6)
-            logger.warning('Gemini transient failure (attempt %s/%s), retrying in %.1fs', attempt + 1, max_attempts, delay)
-            time.sleep(delay)
+    """Retry transient errors, then use a text-only fallback for Gemini 503 overloads.
+
+    A 429 quota error, 401/403 auth error, 404 invalid model, or bad output
+    must be reported rather than bypassed. Image calls retain their model.
+    """
+    def attempt_model(candidate_model, attempts):
+        for attempt in range(attempts):
+            try:
+                return client.models.generate_content(
+                    model=candidate_model, contents=contents, config=config
+                )
+            except Exception as exc:
+                code = getattr(exc, 'code', None) or getattr(exc, 'status_code', None)
+                try:
+                    code = int(code)
+                except (TypeError, ValueError):
+                    code = None
+                message = str(exc).lower()
+                transient = code in (500, 502, 503, 504) or any(
+                    marker in message for marker in (
+                        '500 internal', '502 bad gateway', '503 unavailable',
+                        '504 deadline_exceeded', 'high demand',
+                    )
+                )
+                if not transient or attempt == attempts - 1:
+                    raise
+                delay = min(2 ** (attempt + 1), 8) + random.uniform(0, 0.6)
+                logger.warning('Gemini %s transient failure (attempt %s/%s); retrying in %.1fs',
+                               candidate_model, attempt + 1, attempts, delay)
+                time.sleep(delay)
+
+    primary = model
+    try:
+        return attempt_model(primary, 3)
+    except Exception as exc:
+        code = getattr(exc, 'code', None) or getattr(exc, 'status_code', None)
+        message = str(exc).lower()
+        is_overloaded = str(code) == '503' or '503 unavailable' in message
+        # Only use a text model as a fallback for text generation, never images.
+        modalities = getattr(config, 'response_modalities', None) or []
+        is_image_request = any(str(item).upper().endswith('IMAGE') for item in modalities)
+        fallback = os.getenv('GEMINI_FALLBACK_MODEL', 'gemini-3.1-flash-lite').strip()
+        if not is_overloaded or is_image_request or not fallback or fallback == primary:
+            raise
+        logger.warning('Gemini primary %s unavailable (503); trying fallback %s',
+                       primary, fallback)
+        return attempt_model(fallback, 2)
 
 
-app = FastAPI(title='MarketMind AI', version='3.0.0')
+app = FastAPI(title='MarketMind AI', version='5.0.0')
+# Operational diagnostics: aggregated metrics only, never log credentials, requests or user briefs.
+_stats_lock = threading.Lock()
+_stats = Counter()
+_started = time.monotonic()
+
+@app.middleware('http')
+async def basic_observability(request: Request, call_next):
+    start = time.monotonic()
+    try:
+        response = await call_next(request)
+    except Exception:
+        with _stats_lock:
+            _stats['unhandled_errors'] += 1
+        logger.exception('Unhandled server exception on %s', request.url.path)
+        return JSONResponse({'detail':'Internal error. Check backend logs.'}, status_code=500)
+    elapsed = (time.monotonic() - start) * 1000
+    with _stats_lock:
+        _stats['requests'] += 1
+        if response.status_code >= 400:
+            _stats['http_errors'] += 1
+    if request.url.path.startswith('/api/'):
+        logger.info('request method=%s path=%s status=%s duration_ms=%.0f',
+                    request.method, request.url.path, response.status_code, elapsed)
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    return response
+
+@app.get('/api/metrics')
+def basic_metrics():
+    # Production should restrict this endpoint at the reverse proxy or protect it with auth.
+    with _stats_lock:
+        metrics = dict(_stats)
+    return {'uptime_seconds':int(time.monotonic()-_started), **metrics}
+
 app.add_middleware(CORSMiddleware, allow_origins=[os.getenv('FRONTEND_ORIGIN','http://localhost:5173')], allow_credentials=False, allow_methods=['GET','POST'], allow_headers=['Content-Type'])
 DB_PATH = Path(os.getenv('DATABASE_PATH', 'marketmind.db'))
 if not DB_PATH.is_absolute():
@@ -85,7 +155,7 @@ class SavedCampaign(BaseModel):
 
 @contextmanager
 def get_db():
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=30)
     con.row_factory = sqlite3.Row
     try:
         yield con
@@ -380,7 +450,7 @@ def select_content(campaign_id:int,platform:str,payload:SelectionRequest):
 # ---------------------------------------------------------------------------
 # Phase 3: image prompts, optional reference product photos, image generation
 # ---------------------------------------------------------------------------
-MEDIA_DIR = Path(__file__).parent / 'media'
+MEDIA_DIR = Path(os.getenv('MEDIA_DIR', str(Path(__file__).parent / 'media')))
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 app.mount('/media', StaticFiles(directory=str(MEDIA_DIR)), name='media')
 CREATIVE_FORMATS = {
@@ -543,6 +613,16 @@ async def upload_product_image(campaign_id:int, image:UploadFile=File(...)):
     else:
         raise HTTPException(400,'Upload a valid PNG, JPEG or WebP image.')
     name=f'product_{campaign_id}_{uuid.uuid4().hex}{extension}'
+    try:
+        with Image.open(BytesIO(raw)) as decoded:
+            decoded.verify()
+        with Image.open(BytesIO(raw)) as decoded:
+            if decoded.width * decoded.height > 24_000_000:
+                raise ValueError('Image resolution too large')
+            if decoded.format not in ('PNG', 'JPEG', 'WEBP'):
+                raise ValueError('Unsupported image format')
+    except (ValueError, OSError, Image.DecompressionBombError) as exc:
+        raise HTTPException(400, 'Invalid image file or image dimensions too large.') from exc
     (MEDIA_DIR/name).write_bytes(raw)
     with get_db() as con:
         old=con.execute('SELECT filename FROM product_references WHERE campaign_id=?',(campaign_id,)).fetchone()
@@ -711,6 +791,7 @@ class AgentRunRequest(BaseModel):
     brief: Brief | None = None
     generate_images: bool = True
     image_count: int = Field(default=1, ge=1, le=3)
+    reuse_existing: bool = False
 
 class AgentRegenerateRequest(BaseModel):
     campaign_id: int = Field(gt=0)
@@ -723,7 +804,7 @@ class AgentRegenerateRequest(BaseModel):
 
 def init_agent_tables():
     with get_db() as con:
-        con.execute("""CREATE TABLE IF NOT EXISTS agent_runs (
+        con.execute('''CREATE TABLE IF NOT EXISTS agent_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             campaign_id INTEGER,
             status TEXT NOT NULL,
@@ -732,8 +813,26 @@ def init_agent_tables():
             error TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
-        )""")
+        )''')
+        columns = {row['name'] for row in con.execute('PRAGMA table_info(agent_runs)')}
+        if 'approval_status' not in columns:
+            con.execute("ALTER TABLE agent_runs ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'not_requested'")
+        if 'generate_images' not in columns:
+            con.execute('ALTER TABLE agent_runs ADD COLUMN generate_images INTEGER NOT NULL DEFAULT 1')
+        if 'image_count' not in columns:
+            con.execute('ALTER TABLE agent_runs ADD COLUMN image_count INTEGER NOT NULL DEFAULT 1')
 init_agent_tables()
+
+# A local backend restart may interrupt a synchronous request. Preserve its
+# approval decision and all completed steps for safe continuation.
+with get_db() as _recovery_con:
+    _recovered = _recovery_con.execute(
+        "UPDATE agent_runs SET status='partial', error=?, updated_at=? WHERE status='running'",
+        ('Server restarted before workflow completion. Resume this run.',
+         datetime.now(timezone.utc).isoformat())
+    ).rowcount
+if _recovered:
+    logger.warning('Recovered %s interrupted agent run(s)', _recovered)
 
 
 def campaign_plan(campaign: SavedCampaign):
@@ -750,20 +849,27 @@ def campaign_plan(campaign: SavedCampaign):
             'main_message':campaign.strategy.key_message,
             'selected_platform':platform, 'items':items,
             'publishing_requires_approval':True,
-            'notes':'Drafts only. The agent never posts to social networks.'}
+            'notes':'Human approval is required before final image generation. The agent never posts externally.'}
 
 @app.get('/api/agent/campaigns/{campaign_id}/plan')
 def get_agent_plan(campaign_id:int):
     return campaign_plan(load_campaign_or_404(campaign_id))
+
+
+def _agent_result(row):
+    return {'run_id':row['id'],'id':row['id'],'campaign_id':row['campaign_id'],
+            'status':row['status'],'plan':json.loads(row['plan_json']),
+            'steps':json.loads(row['progress_json']),'error':row['error'],
+            'approval_status':row['approval_status'],
+            'approval_required':row['approval_status']=='pending',
+            'published':False,'created_at':row['created_at']}
 
 @app.get('/api/agent/campaigns/{campaign_id}/runs')
 def agent_history(campaign_id:int):
     load_campaign_or_404(campaign_id)
     with get_db() as con:
         rows=con.execute('SELECT * FROM agent_runs WHERE campaign_id=? ORDER BY id DESC LIMIT 15',(campaign_id,)).fetchall()
-    return [dict(id=r['id'],campaign_id=r['campaign_id'],status=r['status'],
-                 plan=json.loads(r['plan_json']),steps=json.loads(r['progress_json']),
-                 error=r['error'],created_at=r['created_at']) for r in rows]
+    return [_agent_result(r) for r in rows]
 
 
 def _agent_step(run_id, steps, label, status, detail=''):
@@ -773,95 +879,140 @@ def _agent_step(run_id, steps, label, status, detail=''):
                     (json.dumps(steps),datetime.now(timezone.utc).isoformat(),run_id))
 
 
-def _agent_run_for_campaign(campaign_id, generate_images=True, image_count=1, resume_run_id=None):
+def _agent_run_for_campaign(campaign_id, generate_images=True, image_count=1, resume_run_id=None, reuse_existing=False):
     campaign = load_campaign_or_404(campaign_id)
     plan = campaign_plan(campaign)
     stamp = datetime.now(timezone.utc).isoformat()
     with get_db() as con:
         if resume_run_id is None:
-            cur = con.execute('INSERT INTO agent_runs(campaign_id,status,plan_json,created_at,updated_at) VALUES(?,?,?,?,?)',
-                              (campaign_id,'running',json.dumps(plan),stamp,stamp))
+            cur = con.execute('''INSERT INTO agent_runs
+                (campaign_id,status,plan_json,created_at,updated_at,generate_images,image_count)
+                VALUES(?,?,?,?,?,?,?)''',
+                (campaign_id,'running',json.dumps(plan),stamp,stamp,int(generate_images),image_count))
             run_id = cur.lastrowid
             steps = []
+            approval_status = 'not_requested'
         else:
             row = con.execute('SELECT * FROM agent_runs WHERE id=? AND campaign_id=?',
-                              (resume_run_id, campaign_id)).fetchone()
+                              (resume_run_id,campaign_id)).fetchone()
             if row is None:
-                raise HTTPException(404, 'Automation run not found for this campaign.')
-            if row['status'] != 'partial':
-                raise HTTPException(409, 'Only partial automation runs can be resumed.')
-            # Never re-run completed steps, even if previous requests changed current UI selection.
-            steps = [item for item in json.loads(row['progress_json']) if item.get('status') == 'completed']
+                raise HTTPException(404,'Agent run not found for this campaign.')
+            if row['status'] not in ('partial','approved'):
+                raise HTTPException(409,'Only interrupted or approved runs can resume.')
+            if row['approval_status']=='rejected':
+                raise HTTPException(409,'Rejected run cannot resume. Start a new run.')
+            approval_status = row['approval_status']
+            generate_images = bool(row['generate_images'])
+            image_count = row['image_count']
+            steps = [item for item in json.loads(row['progress_json']) if item.get('status')=='completed']
             run_id = resume_run_id
-            con.execute('UPDATE agent_runs SET status=?, error=NULL, progress_json=?, updated_at=? WHERE id=?',
-                        ('running', json.dumps(steps), stamp, run_id))
-    done = {item['step'] for item in steps if item['status'] == 'completed'}
+            con.execute('''UPDATE agent_runs SET status='running',error=NULL,
+                progress_json=?,updated_at=? WHERE id=?''',(json.dumps(steps),stamp,run_id))
+    done = {item['step'] for item in steps if item['status']=='completed'}
     def step_once(label, action, detail):
         if label not in done:
             action()
-            _agent_step(run_id, steps, label, 'completed', detail)
+            _agent_step(run_id,steps,label,'completed',detail)
             done.add(label)
 
     try:
-        step_once('Marketing strategy', lambda: None, 'Using saved structured strategy')
-        step_once('Campaign planner', lambda: None, f"{len(plan['items'])} content formats planned")
+        step_once('Marketing strategy',lambda:None,'Using saved structured strategy')
+        step_once('Campaign planner',lambda:None,f"{len(plan['items'])} content formats planned")
         for item in plan['items']:
-            p = item['platform']
+            platform = item['platform']
             fmt = item['creative_format']
-            step_once(f'{p} copy',
-                      lambda p=p: generate_content(ContentRequest(campaign_id=campaign_id, platform=p, count=3)),
-                      'Three structured variations saved')
+            step_once(f'{platform} copy',
+                lambda platform=platform: None if (reuse_existing and len(read_content(campaign_id,platform).variations)==3) else generate_content(ContentRequest(campaign_id=campaign_id,platform=platform,count=3)),
+                'Three structured variations saved')
             step_once(f'{fmt} concepts',
-                      lambda fmt=fmt: generate_creative_concepts(CreativeConceptRequest(campaign_id=campaign_id, creative_format=fmt)),
-                      'Three prompts saved')
-            if generate_images:
-                for index in range(1, image_count + 1):
+                lambda fmt=fmt: None if (reuse_existing and len(fetch_creatives(campaign_id,fmt).get('concepts',[]))==3) else generate_creative_concepts(CreativeConceptRequest(campaign_id=campaign_id,creative_format=fmt)),
+                'Three visual prompts saved')
+
+        # Mandatory server-side checkpoint. No image API call occurs until an
+        # explicit approve decision is stored in SQLite for THIS run ID.
+        if approval_status!='approved':
+            with get_db() as con:
+                con.execute('''UPDATE agent_runs SET status='awaiting_approval',
+                    approval_status='pending',error=NULL,updated_at=? WHERE id=?''',
+                    (datetime.now(timezone.utc).isoformat(),run_id))
+            return {'run_id':run_id,'campaign_id':campaign_id,'status':'awaiting_approval',
+                    'plan':plan,'steps':steps,'error':None,'approval_status':'pending',
+                    'approval_required':True,'published':False}
+
+        if generate_images:
+            for item in plan['items']:
+                fmt=item['creative_format']
+                for index in range(1,image_count+1):
                     step_once(f'{fmt} image {index}',
-                              lambda fmt=fmt, index=index: generate_creative_image(CreativeImageRequest(
-                                  campaign_id=campaign_id, creative_format=fmt, concept_index=index)),
-                              'Creative saved locally')
-        status = 'completed'
-        error = None
+                        lambda fmt=fmt,index=index: generate_creative_image(CreativeImageRequest(
+                            campaign_id=campaign_id,creative_format=fmt,concept_index=index)),
+                        'Approved creative saved locally')
+        step_once('Human approval',lambda:None,'Final drafts approved by user')
+        status='completed'
+        error=None
     except Exception as exc:
-        status = 'partial'
-        error = exc.detail if isinstance(exc, HTTPException) else str(exc)
-        _agent_step(run_id, steps, 'Workflow interrupted', 'failed', str(error)[:350])
-        logger.warning('Agent run %s partially completed: %s', run_id, error)
+        status='partial'
+        error=exc.detail if isinstance(exc,HTTPException) else str(exc)
+        _agent_step(run_id,steps,'Workflow interrupted','failed',str(error)[:350])
+        logger.warning('Agent run %s partially completed: %s',run_id,error)
     with get_db() as con:
         con.execute('UPDATE agent_runs SET status=?,error=?,updated_at=? WHERE id=?',
-                    (status, error, datetime.now(timezone.utc).isoformat(), run_id))
-    return {'run_id': run_id, 'campaign_id': campaign_id, 'status': status,
-            'plan': plan, 'steps': steps, 'error': error,
-            'approval_required': True, 'published': False}
+                    (status,error,datetime.now(timezone.utc).isoformat(),run_id))
+    return {'run_id':run_id,'campaign_id':campaign_id,'status':status,
+            'plan':plan,'steps':steps,'error':error,'approval_status':approval_status,
+            'approval_required':False,'published':False}
+
+
+class AgentDecisionRequest(BaseModel):
+    decision: Literal['approve','reject']
+
+@app.post('/api/agent/runs/{run_id}/decision')
+def decide_agent_run(run_id:int,payload:AgentDecisionRequest):
+    # Conditional write protects against stale tabs and duplicate approvals.
+    now=datetime.now(timezone.utc).isoformat()
+    with get_db() as con:
+        row=con.execute('SELECT * FROM agent_runs WHERE id=?',(run_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404,'Agent run not found.')
+        if row['status']!='awaiting_approval' or row['approval_status']!='pending':
+            raise HTTPException(409,'This run is no longer awaiting approval.')
+        if payload.decision=='reject':
+            con.execute('''UPDATE agent_runs SET status='rejected',approval_status='rejected',updated_at=?
+                WHERE id=? AND status='awaiting_approval' AND approval_status='pending' ''',(now,run_id))
+        else:
+            con.execute('''UPDATE agent_runs SET status='approved',approval_status='approved',updated_at=?
+                WHERE id=? AND status='awaiting_approval' AND approval_status='pending' ''',(now,run_id))
+    if payload.decision=='reject':
+        with get_db() as con:
+            return _agent_result(con.execute('SELECT * FROM agent_runs WHERE id=?',(run_id,)).fetchone())
+    return _agent_run_for_campaign(row['campaign_id'],resume_run_id=run_id)
 
 
 class AgentResumeRequest(BaseModel):
-    run_id: int = Field(gt=0)
-    generate_images: bool = True
-    image_count: int = Field(default=1, ge=1, le=3)
-
+    run_id:int=Field(gt=0)
+    generate_images:bool=True
+    image_count:int=Field(default=1,ge=1,le=3)
 
 @app.post('/api/agent/resume')
-def resume_marketing_agent(payload: AgentResumeRequest):
+def resume_marketing_agent(payload:AgentResumeRequest):
     with get_db() as con:
-        row = con.execute('SELECT campaign_id FROM agent_runs WHERE id=?', (payload.run_id,)).fetchone()
+        row=con.execute('SELECT * FROM agent_runs WHERE id=?',(payload.run_id,)).fetchone()
     if row is None:
-        raise HTTPException(404, 'Automation run not found.')
-    return _agent_run_for_campaign(row['campaign_id'], payload.generate_images,
-                                   payload.image_count, resume_run_id=payload.run_id)
-
+        raise HTTPException(404,'Automation run not found.')
+    if row['status']!='partial':
+        raise HTTPException(409,'Only interrupted runs can be resumed.')
+    return _agent_run_for_campaign(row['campaign_id'],resume_run_id=payload.run_id)
 
 @app.post('/api/agent/run')
-def run_marketing_agent(payload: AgentRunRequest):
+def run_marketing_agent(payload:AgentRunRequest):
     if payload.brief is None and payload.campaign_id is None:
         raise HTTPException(422,'Provide a saved campaign_id or a new campaign brief.')
     if payload.brief is not None and payload.campaign_id is not None:
         raise HTTPException(422,'Provide either a brief or a campaign_id, not both.')
     if payload.brief is not None:
-        # This step always creates the strategy before any copy or creatives.
         new_campaign=generate_strategy(payload.brief)
-        return _agent_run_for_campaign(new_campaign.id,payload.generate_images,payload.image_count)
-    return _agent_run_for_campaign(payload.campaign_id,payload.generate_images,payload.image_count)
+        return _agent_run_for_campaign(new_campaign.id,payload.generate_images,payload.image_count,reuse_existing=payload.reuse_existing)
+    return _agent_run_for_campaign(payload.campaign_id,payload.generate_images,payload.image_count,reuse_existing=payload.reuse_existing)
 
 @app.post('/api/agent/regenerate')
 def agent_regenerate(payload: AgentRegenerateRequest):
@@ -897,3 +1048,10 @@ def agent_regenerate(payload: AgentRegenerateRequest):
         con.execute('UPDATE campaigns SET strategy_json=? WHERE id=?',(refreshed.model_dump_json(),campaign.id))
     return {'level':'strategy','campaign_id':campaign.id,'strategy':refreshed.model_dump(),
             'notice':'Older copy/images remain saved as historical drafts, but must be regenerated to match the new strategy.'}
+
+
+# Production single-service hosting. Build frontend with Vite before starting
+# the backend. API and media mounts declared above take precedence.
+FRONTEND_DIST = Path(__file__).resolve().parent.parent / 'frontend' / 'dist'
+if FRONTEND_DIST.is_dir():
+    app.mount('/', StaticFiles(directory=str(FRONTEND_DIST), html=True), name='frontend')
