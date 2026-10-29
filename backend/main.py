@@ -989,7 +989,7 @@ def _agent_run_for_campaign(campaign_id, generate_images=True, image_count=1, re
                 (campaign_id,status,plan_json,created_at,updated_at,generate_images,image_count)
                 VALUES(?,?,?,?,?,?,?)''',
                 (campaign_id,'running',json.dumps(plan),stamp,stamp,int(generate_images),image_count))
-            run_id = cur.lastrowid
+            run_id = con.lastrowid
             steps = []
             approval_status = 'not_requested'
         else:
