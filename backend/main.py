@@ -248,7 +248,7 @@ def generate_strategy(brief:Brief):
     with get_db() as con:
         cursor=con.execute('INSERT INTO campaigns(created_at,brief_json,strategy_json) VALUES (?,?,?)',
                           (created_at,brief.model_dump_json(),strategy.model_dump_json()))
-        campaign_id=cursor.lastrowid
+        campaign_id=con.lastrowid
     return SavedCampaign(id=campaign_id,created_at=created_at,brief=brief,strategy=strategy)
 
 @app.get('/api/campaigns',response_model=list[SavedCampaign])
