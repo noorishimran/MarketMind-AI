@@ -10,8 +10,9 @@ import random
 import threading
 from collections import Counter
 from fastapi import Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from contextlib import contextmanager
+from urllib.parse import quote
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -115,7 +116,9 @@ def basic_metrics():
         metrics = dict(_stats)
     return {'uptime_seconds':int(time.monotonic()-_started), **metrics}
 
-app.add_middleware(CORSMiddleware, allow_origins=[os.getenv('FRONTEND_ORIGIN','http://localhost:5173')], allow_credentials=False, allow_methods=['GET','POST'], allow_headers=['Content-Type'])
+app.add_middleware(CORSMiddleware, allow_origins=[x.strip() for x in os.getenv('FRONTEND_ORIGIN','http://localhost:5173').split(',') if x.strip()], allow_credentials=False, allow_methods=['GET','POST'], allow_headers=['Content-Type'])
+if os.getenv('VERCEL') and not os.getenv('DATABASE_URL'):
+    raise RuntimeError('DATABASE_URL is required on Vercel (Supabase transaction pooler).')
 DB_PATH = Path(os.getenv('DATABASE_PATH', 'marketmind.db'))
 if not DB_PATH.is_absolute():
     DB_PATH = Path(__file__).parent / DB_PATH
@@ -153,15 +156,45 @@ class SavedCampaign(BaseModel):
     brief: Brief
     strategy: Strategy
 
+# Use Supabase Postgres on Vercel; keep SQLite for local development.
+DATABASE_URL = os.getenv('DATABASE_URL', '').strip()
+if DATABASE_URL:
+    import psycopg
+    from psycopg.rows import dict_row
+
+    class PGConnection:
+        def __init__(self, raw):
+            self.raw = raw
+            self.lastrowid = None
+        def execute(self, sql, params=None):
+            statement = sql.strip()
+            if statement.startswith('PRAGMA table_info(agent_runs)'):
+                return self.raw.execute("SELECT column_name AS name FROM information_schema.columns WHERE table_schema='public' AND table_name='agent_runs'")
+            statement = statement.replace('INTEGER PRIMARY KEY AUTOINCREMENT', 'BIGSERIAL PRIMARY KEY')
+            statement = statement.replace('?', '%s')
+            if statement.upper().startswith('INSERT INTO CAMPAIGNS(') or statement.upper().startswith('INSERT INTO AGENT_RUNS'):
+                statement += ' RETURNING id'
+                cur = self.raw.execute(statement, params)
+                self.lastrowid = cur.fetchone()['id']
+                return cur
+            return self.raw.execute(statement, params)
+
 @contextmanager
 def get_db():
-    con = sqlite3.connect(DB_PATH, timeout=30)
-    con.row_factory = sqlite3.Row
-    try:
-        yield con
-        con.commit()
-    finally:
-        con.close()
+    if DATABASE_URL:
+        # Transaction pooler (port 6543) supports serverless IPv4 connections.
+        # Disable prepared statements to work with Supavisor transaction mode.
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row, prepare_threshold=None,
+                             connect_timeout=12, sslmode='require') as raw:
+            yield PGConnection(raw)
+    else:
+        con = sqlite3.connect(DB_PATH, timeout=30)
+        con.row_factory = sqlite3.Row
+        try:
+            yield con
+            con.commit()
+        finally:
+            con.close()
 
 def init_db():
     with get_db() as con:
@@ -451,8 +484,74 @@ def select_content(campaign_id:int,platform:str,payload:SelectionRequest):
 # Phase 3: image prompts, optional reference product photos, image generation
 # ---------------------------------------------------------------------------
 MEDIA_DIR = Path(os.getenv('MEDIA_DIR', str(Path(__file__).parent / 'media')))
-MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-app.mount('/media', StaticFiles(directory=str(MEDIA_DIR)), name='media')
+SUPABASE_URL = os.getenv('SUPABASE_URL', '').rstrip('/')
+SUPABASE_SERVICE_ROLE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY', '')
+STORAGE_BUCKET = os.getenv('SUPABASE_STORAGE_BUCKET', 'marketmind-images')
+CLOUD_STORAGE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+if os.getenv('VERCEL') and not CLOUD_STORAGE:
+    raise RuntimeError('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required on Vercel.')
+if not CLOUD_STORAGE:
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    app.mount('/media', StaticFiles(directory=str(MEDIA_DIR)), name='media')
+
+def _storage_headers(content_type=None):
+    headers = {'apikey': SUPABASE_SERVICE_ROLE_KEY,
+               'Authorization': 'Bearer ' + SUPABASE_SERVICE_ROLE_KEY}
+    if content_type:
+        headers['Content-Type'] = content_type
+    return headers
+
+def store_media(name, data, mime):
+    if not CLOUD_STORAGE:
+        (MEDIA_DIR / name).write_bytes(data)
+        return
+    url = f'{SUPABASE_URL}/storage/v1/object/{quote(STORAGE_BUCKET)}/{quote(name)}'
+    with httpx.Client(timeout=45) as client:
+        response = client.post(url, headers=_storage_headers(mime), content=data)
+    response.raise_for_status()
+
+def remove_media(name):
+    if not CLOUD_STORAGE:
+        (MEDIA_DIR / name).unlink(missing_ok=True)
+        return
+    url = f'{SUPABASE_URL}/storage/v1/object/{quote(STORAGE_BUCKET)}/{quote(name)}'
+    with httpx.Client(timeout=20) as client:
+        response = client.delete(url, headers=_storage_headers())
+    if response.status_code >= 400:
+        logger.warning('Could not delete old storage object: HTTP %s', response.status_code)
+
+def read_media(name):
+    if not CLOUD_STORAGE:
+        return (MEDIA_DIR / name).read_bytes()
+    url = f'{SUPABASE_URL}/storage/v1/object/authenticated/{quote(STORAGE_BUCKET)}/{quote(name)}'
+    with httpx.Client(timeout=30) as client:
+        response = client.get(url, headers=_storage_headers())
+    response.raise_for_status()
+    return response.content
+
+def media_url(name):
+    if not CLOUD_STORAGE:
+        return '/media/' + name
+    # Private bucket: give browser a temporary URL, never expose service role key.
+    url = f'{SUPABASE_URL}/storage/v1/object/sign/{quote(STORAGE_BUCKET)}/{quote(name)}'
+    with httpx.Client(timeout=15) as client:
+        response = client.post(url, headers=_storage_headers('application/json'), json={'expiresIn': 3600})
+    response.raise_for_status()
+    signed = response.json()['signedURL']
+    if signed.startswith('http'):
+        return signed
+    return SUPABASE_URL + ('/storage/v1' if signed.startswith('/object/') else '') + signed
+
+def hydrate_creative_urls(images):
+    if not CLOUD_STORAGE:
+        return images
+    hydrated = {}
+    for index, item in images.items():
+        entry = dict(item)
+        if entry.get('url', '').startswith('/media/'):
+            entry['url'] = media_url(entry['url'].split('/media/', 1)[1])
+        hydrated[index] = entry
+    return hydrated
 CREATIVE_FORMATS = {
     'Instagram Post': ('1:1', 'square social feed'),
     'Instagram Story': ('9:16', 'vertical full-screen story'),
@@ -521,9 +620,9 @@ def fetch_creatives(campaign_id, fmt):
     with get_db() as con:
         row = con.execute('SELECT * FROM creative_campaigns WHERE campaign_id=? AND creative_format=?', (campaign_id, fmt)).fetchone()
     if not row:
-        return {'campaign_id':campaign_id, 'creative_format':fmt, 'concepts':[], 'images':{}, 'selected_index':None, 'reference_url': ('/media/' + get_reference(campaign_id)['filename']) if get_reference(campaign_id) else None}
+        return {'campaign_id':campaign_id, 'creative_format':fmt, 'concepts':[], 'images':{}, 'selected_index':None, 'reference_url': media_url(get_reference(campaign_id)['filename']) if get_reference(campaign_id) else None}
     ref = get_reference(campaign_id)
-    return {'campaign_id':campaign_id, 'creative_format':fmt, 'concepts':json.loads(row['concepts_json']), 'images':json.loads(row['images_json']), 'selected_index':row['selected_index'], 'reference_url':'/media/'+ref['filename'] if ref else None}
+    return {'campaign_id':campaign_id, 'creative_format':fmt, 'concepts':json.loads(row['concepts_json']), 'images':hydrate_creative_urls(json.loads(row['images_json'])), 'selected_index':row['selected_index'], 'reference_url':media_url(ref['filename']) if ref else None}
 
 
 def creative_error(exc):
@@ -623,13 +722,13 @@ async def upload_product_image(campaign_id:int, image:UploadFile=File(...)):
                 raise ValueError('Unsupported image format')
     except (ValueError, OSError, Image.DecompressionBombError) as exc:
         raise HTTPException(400, 'Invalid image file or image dimensions too large.') from exc
-    (MEDIA_DIR/name).write_bytes(raw)
+    store_media(name, raw, mime)
     with get_db() as con:
         old=con.execute('SELECT filename FROM product_references WHERE campaign_id=?',(campaign_id,)).fetchone()
         con.execute('INSERT INTO product_references(campaign_id,filename,mime_type) VALUES (?,?,?) ON CONFLICT(campaign_id) DO UPDATE SET filename=excluded.filename,mime_type=excluded.mime_type',(campaign_id,name,mime))
     if old and old['filename']!=name:
-        (MEDIA_DIR/old['filename']).unlink(missing_ok=True)
-    return {'reference_url':'/media/'+name}
+        remove_media(old['filename'])
+    return {'reference_url':media_url(name)}
 
 @app.get('/api/campaigns/{campaign_id}/creatives')
 def get_all_creatives(campaign_id:int):
@@ -704,9 +803,7 @@ def generate_creative_image(payload:CreativeImageRequest):
                 raise HTTPException(503,'Neither Cloudflare credentials nor Gemini API key are configured in backend/.env')
             contents=[prompt]
             if reference:
-                path=MEDIA_DIR/reference['filename']
-                if path.is_file():
-                    contents.append(types.Part.from_bytes(data=path.read_bytes(),mime_type=reference['mime_type']))
+                contents.append(types.Part.from_bytes(data=read_media(reference['filename']),mime_type=reference['mime_type']))
             client=genai.Client(api_key=api_key)
             try:
                 response=gemini_generate_with_retry(client, 
@@ -749,15 +846,18 @@ def generate_creative_image(payload:CreativeImageRequest):
                 target = FORMAT_IMAGE_SIZES[payload.creative_format]
                 formatted = ImageOps.fit(source.convert('RGB'), target, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
                 buffer = BytesIO()
-                formatted.save(buffer, format='PNG')
+                formatted.save(buffer, format='JPEG', quality=88, optimize=True)
                 image_bytes = buffer.getvalue()
-                extension = '.png'
+                extension = '.jpg'
         except Exception as exc:
             logger.exception('Image post-processing failed')
             raise HTTPException(502, 'The image was generated, but resizing to the selected creative format failed.') from exc
     name=f'creative_{payload.campaign_id}_{uuid.uuid4().hex}{extension}'
-    (MEDIA_DIR/name).write_bytes(image_bytes)
-    images=existing['images']
+    store_media(name, image_bytes, 'image/png' if extension == '.png' else ('image/jpeg' if extension == '.jpg' else 'image/webp'))
+    with get_db() as con:
+        _record = con.execute('SELECT images_json FROM creative_campaigns WHERE campaign_id=? AND creative_format=?',
+                              (payload.campaign_id, payload.creative_format)).fetchone()
+    images = json.loads(_record['images_json'])
     images[str(payload.concept_index)]={'url':'/media/'+name,'instructions':payload.instructions,'prompt':prompt}
     with get_db() as con:
         con.execute('UPDATE creative_campaigns SET images_json=?,selected_index=NULL,updated_at=? WHERE campaign_id=? AND creative_format=?',
@@ -946,7 +1046,7 @@ def _agent_run_for_campaign(campaign_id, generate_images=True, image_count=1, re
                     step_once(f'{fmt} image {index}',
                         lambda fmt=fmt,index=index: generate_creative_image(CreativeImageRequest(
                             campaign_id=campaign_id,creative_format=fmt,concept_index=index)),
-                        'Approved creative saved locally')
+                        'Approved creative saved to storage')
         step_once('Human approval',lambda:None,'Final drafts approved by user')
         status='completed'
         error=None
