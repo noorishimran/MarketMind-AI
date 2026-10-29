@@ -2,34 +2,52 @@
 
 **Full-Stack AI Marketing Content Generator | Big Brains Generative AI Internship**
 
-MarketMind AI is a full-stack web application that turns a product brief into a structured marketing strategy, platform-specific marketing copy, and AI-generated visual concepts and images. It also includes an AI campaign agent with a **human approval checkpoint** before the agent proceeds to final image generation. The application saves campaigns, drafts, and automation runs locally for review.
+MarketMind AI is a full-stack web application that transforms a product brief into an AI-generated marketing strategy, platform-specific copy, visual concepts, and generated images. It includes a campaign automation agent with a **human approval checkpoint** before final image generation.
 
-> **Project status:** Phases 1–4 implemented and locally tested. This is an internship prototype, not a production-ready multi-user SaaS or social-media publishing platform.
+### Live demo
+
+- **Frontend:** https://market-mind-steel.vercel.app
+- **Backend health check:** https://marketmind-backend-ten.vercel.app/api/health
+- **Source code:** https://github.com/noorishimran/MarketMind-AI
+
+> **Project status:** Phases 1–4 are implemented and deployed. Core end-to-end workflows have been tested on the live application, including campaign creation, content generation, AI images, approval-based automation, saved history, and mobile layout. This is an internship prototype, **not** a production-ready multi-user SaaS or automated social-media publishing service.
 
 ## Features
 
-### Phase 1 — Campaign Strategy
-- Campaign brief with input validation: product, description, target audience, platform, objective, tone, and language.
-- Gemini-generated structured strategy containing campaign idea, audience angle, selling points, CTA, content pillars, and recommended formats.
-- Campaign persistence and history in SQLite.
+### Phase 1 — AI Marketing Strategy
 
-### Phase 2 — Marketing Content
-- Platform-specific structured content for **Instagram, Instagram Stories, LinkedIn, Facebook, and YouTube**.
-- Three content variations per platform, with copy and preferred-version selection.
-- Saved output tied to the campaign strategy.
+- Campaign brief with validation for product name, description, target audience, platform, objective, tone, and language.
+- Structured marketing strategy generated with Google Gemini: campaign idea, audience angle, selling points, CTA, content pillars, and recommended formats.
+- Campaign history and persistent campaign records.
+
+### Phase 2 — Platform-Specific Content
+
+- Generates structured content for **Instagram, Instagram Stories, LinkedIn, Facebook, and YouTube**.
+- Up to three variations per selected format, including hooks, main copy, calls to action, and hashtags where applicable.
+- Allows selecting preferred content and reopening previously generated drafts.
 
 ### Phase 3 — AI Creative Studio
-- Three visual concepts and prompts for Instagram Post, Instagram Story, LinkedIn Creative, Facebook Ad, and YouTube Thumbnail.
-- AI image generation using Cloudflare Workers AI when configured.
-- Optional product reference image upload, image adjustments, and preferred-image selection.
-- Generated image assets saved in the local media directory.
+
+- Generates three creative concepts with descriptive AI image prompts.
+- Supports **Instagram Post, Instagram Story, LinkedIn Creative, Facebook Ad, and YouTube Thumbnail** formats.
+- Generates images with Cloudflare Workers AI when configured and quota permits.
+- Optional reference image upload, image adjustments, and preferred-image selection.
+- Saves images and associates them with their campaigns.
 
 ### Phase 4 — AI Campaign Agent
-- Guided workflow from marketing strategy through platform content and creative concepts.
-- **Human-in-the-loop approval:** agent pauses with `awaiting_approval` before final image generation.
-- **Approve & Continue**, **Reject**, and resume controls for saved runs.
-- Persistent run history and step statuses.
-- Generates local drafts only; **does not publish or post externally**.
+
+- Coordinates strategy, campaign planning, copy, and visual concepts.
+- Pauses at **`awaiting_approval`** so a person can review draft content and concepts.
+- Supports **Approve & Continue**, rejection, saved runs, and execution history.
+- Generates approved visual drafts; **does not automatically publish to social networks**.
+
+### Phase 5 — Testing and Deployment
+
+- Frontend and backend deployed separately on Vercel.
+- PostgreSQL-backed campaign and automation history in the hosted deployment.
+- Image assets stored in Supabase Storage.
+- Major workflows tested using leather-goods and restaurant campaigns, including persistence after refreshing the page.
+- Responsive layout checked at a mobile viewport width of 400 px.
 
 ## Tech Stack
 
@@ -37,45 +55,51 @@ MarketMind AI is a full-stack web application that turns a product brief into a 
 | --- | --- |
 | Frontend | React, Vite, JavaScript, CSS |
 | Backend | Python, FastAPI, Pydantic |
-| Text AI | Google Gemini API |
-| Image AI | Cloudflare Workers AI (configured model) |
-| Persistence | SQLite |
-| Image handling | Pillow |
+| Text and planning AI | Google Gemini API |
+| AI image generation | Cloudflare Workers AI |
+| Hosted database | Supabase PostgreSQL |
+| Hosted image storage | Supabase Storage |
+| Local development persistence | SQLite, when configured for local mode |
+| Image processing | Pillow |
+| Deployment | Vercel (frontend and backend) |
 
 ## Architecture
 
 ```text
-React + Vite (http://localhost:5173)
-    │  HTTP requests via /api
-    ▼
-FastAPI (http://127.0.0.1:8000)
-    ├── Pydantic request and response validation
-    ├── Gemini: marketing strategy, copy and image concepts
-    ├── Cloudflare Workers AI: visual generation
-    ├── AI agent: run → await approval → approve/reject → continue
-    ├── SQLite: campaigns, generated content, creatives and agent runs
-    └── Local backend/media: uploaded references and generated images
+Browser
+  |
+  v
+React + Vite frontend (Vercel)
+  |  HTTPS API requests
+  v
+FastAPI backend (Vercel)
+  |-- Google Gemini: campaign strategy, copy, visual concepts
+  |-- Cloudflare Workers AI: image generation
+  |-- Agent workflow: plan -> approval -> continue/reject
+  |-- Supabase PostgreSQL: campaigns, drafts, creatives, agent runs
+  `-- Supabase Storage: uploaded and AI-generated images
 ```
 
-## Prerequisites
+In local development, the frontend typically runs at `http://localhost:5173` and the backend at `http://127.0.0.1:8000`. Storage and database behavior depend on the configured environment variables; the hosted configuration uses Supabase.
 
-- Python 3.11+ (the project has also been developed with Python 3.13)
+## Requirements
+
+- Python 3.11+
 - Node.js 20+
-- A [Gemini API key](https://aistudio.google.com/apikey)
+- Google Gemini API key
 - Cloudflare account ID and Workers AI API token for image generation
+- For cloud persistence: Supabase project with a PostgreSQL connection and image-storage bucket
 
-## Local Setup (Windows PowerShell)
+## Run Locally (Windows PowerShell)
 
-Clone the repository and open the project folder:
+### 1. Clone the repository
 
 ```powershell
 git clone https://github.com/noorishimran/MarketMind-AI.git
 cd MarketMind-AI
 ```
 
-### 1. Backend
-
-From the project root:
+### 2. Start the backend
 
 ```powershell
 cd backend
@@ -85,114 +109,130 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Edit `backend/.env` and insert your own credentials. Example configuration (actual available models and environment-variable names should be checked against `backend/.env.example`):
+Set your own values in `backend/.env`. Use the variable names supported by your current backend and `.env.example`. Example:
 
-```env
-GEMINI_API_KEY=your_gemini_api_key_here
-GEMINI_MODEL=gemini-3.1-flash-lite
-GEMINI_FALLBACK_MODEL=gemini-3.1-flash-lite
+```dotenv
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_MODEL=your_available_gemini_model
+GEMINI_FALLBACK_MODEL=your_available_fallback_model
 CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
 CLOUDFLARE_API_TOKEN=your_cloudflare_api_token
 CLOUDFLARE_IMAGE_MODEL=@cf/black-forest-labs/flux-1-schnell
 FRONTEND_ORIGIN=http://localhost:5173
+
+# Optional for hosted-style cloud persistence:
+# DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DBNAME
+# SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+# SUPABASE_SERVICE_ROLE_KEY=your_server_side_service_role_key
+# SUPABASE_STORAGE_BUCKET=marketmind-images
 ```
 
-The `GEMINI_MODEL` value is an example only. Use a model your API key can access and that has remaining quota. Model names and API availability can change.
-
-Start the backend:
+**Security:** Never put your service-role key, Gemini key, or Cloudflare token in frontend variables, Git commits, or screenshots. Ensure the Supabase bucket and access policies are configured appropriately. Never commit `.env`.
 
 ```powershell
 uvicorn main:app --reload
 ```
 
-Backend API docs: http://127.0.0.1:8000/docs  
-Health endpoint: http://127.0.0.1:8000/api/health
+Backend health check: http://127.0.0.1:8000/api/health  
+Interactive API documentation: http://127.0.0.1:8000/docs
 
-If PowerShell prevents activation, run the backend via `.venv\Scripts\python.exe -m uvicorn main:app --reload`.
+If PowerShell prevents activation, use `.\.venv\Scripts\python.exe -m uvicorn main:app --reload`.
 
-### 2. Frontend
+### 3. Start the frontend
 
-In a **second terminal**, from the project root:
+Open a **second terminal** at the repository root:
 
 ```powershell
 cd frontend
 npm install
+```
+
+Create `frontend/.env.local` to point at the local API:
+
+```dotenv
+VITE_API_BASE_URL=http://127.0.0.1:8000
+```
+
+Then start the dev server:
+
+```powershell
 npm run dev
 ```
 
 Open http://localhost:5173.
 
-## How to Use
+## Deployed Environment
 
-1. Enter a product brief and generate a marketing strategy.
-2. Open Phase 2 to create and select platform-specific marketing copy.
-3. Use Phase 3 to generate concepts, create AI images, and select a preferred visual.
-4. In Phase 4, select **Run Complete Campaign Agent** to automate draft creation.
-5. When the agent reaches **Human Approval Required**, review its drafts and concepts. Choose **Approve & Continue** for final image generation or **Reject** to stop that run.
-6. Use Campaign History and Saved Automation Runs to reopen prior work.
+The live deployment separates the frontend and backend into Vercel projects. The frontend's `VITE_API_BASE_URL` points to the backend's HTTPS domain; the backend's `FRONTEND_ORIGIN` allows the production frontend origin. Backend secrets and Supabase credentials must be set only in the **backend's** environment settings.
+
+| Setting | Purpose |
+| --- | --- |
+| `VITE_API_BASE_URL` | Frontend setting: backend HTTPS URL |
+| `FRONTEND_ORIGIN` | Backend setting: allowed frontend origin |
+| `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL` | Gemini configuration |
+| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_IMAGE_MODEL` | Cloudflare image generation |
+| `DATABASE_URL` | PostgreSQL connection for hosted persistence |
+| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_STORAGE_BUCKET` | Server-side image storage |
+
+**Do not store production secret values in this README.** Service availability and API quotas can affect generation.
+
+## Usage
+
+1. Create a campaign from a product brief and generate its marketing strategy.
+2. Generate platform-specific content and select a preferred variation.
+3. Generate visual concepts and images, then select a preferred creative.
+4. Launch the AI campaign agent. Review the plan and draft content when it reaches `awaiting_approval`.
+5. Approve to continue generating final images, or reject the run.
+6. Reopen campaigns, drafts, images, and saved automation runs from history.
 
 ## Testing Checklist
 
-- [ ] Backend health endpoint returns `status: ok`.
-- [ ] Empty/invalid campaign form shows validation feedback.
-- [ ] Strategy is generated, saved, and reappears in campaign history.
-- [ ] Content generation returns three variations for the selected platform.
-- [ ] AI creative concepts generate correctly.
-- [ ] Images generate and display when image-service quota is available.
-- [ ] Agent pauses at `awaiting_approval` before generating its final image.
-- [ ] Reject records a rejected run.
-- [ ] Approve & Continue resumes and completes the workflow.
-- [ ] Frontend production build passes: `cd frontend; npm run build`.
+The following checks reflect the live workflow tests performed for the internship demo, not a full security or load-test certification.
 
-Locally tested example domains include e-commerce, education, restaurant, software, and clothing. API rate limits, billing, and model availability may affect repeatability.
+- [x] Backend health check reports a healthy API configuration.
+- [x] Marketing strategy is generated and saved.
+- [x] Campaign history reloads previously saved data.
+- [x] Platform content generation produces three variations.
+- [x] Creative concepts and AI-generated images display in the web app.
+- [x] Generated image files appear in Supabase Storage.
+- [x] AI agent reaches `awaiting_approval` before final image generation.
+- [x] Approve & Continue proceeds to a `completed` automation run.
+- [x] Mobile form fields and buttons fit a 400 px responsive viewport.
+- [ ] Verify a rejected automation run is saved with the expected status.
+- [ ] Verify invalid-form errors and failure states across all inputs.
+- [ ] Run and record a fresh `npm run build` result.
 
 ## Project Structure
 
 ```text
 MarketMind-AI/
-├── backend/
-│   ├── main.py                 # API and campaign-agent workflows
-│   ├── requirements.txt
-│   ├── .env.example            # Safe configuration template
-│   ├── marketmind.db           # Local-only, Git ignored
-│   └── media/                  # Local-only generated assets, Git ignored
-├── frontend/
-│   ├── src/
-│   │   ├── App.jsx
-│   │   └── styles.css
-│   ├── package.json
-│   └── ...
-├── .gitignore (or component-level .gitignore files)
-└── README.md
+|-- backend/
+|   |-- main.py              # FastAPI endpoints and agent workflow
+|   |-- requirements.txt
+|   `-- .env.example         # Configuration template (no secrets)
+|-- frontend/
+|   |-- src/
+|   |   |-- App.jsx
+|   |   `-- styles.css
+|   `-- package.json
+|-- README.md
+`-- .gitignore                # Or component-level ignore files
 ```
 
-## API and Data Notes
+Local database files, local media, virtual environments, and credentials must remain excluded from version control.
 
-- Campaign, content, creative, and agent-run records are stored in a local SQLite database.
-- Generated assets and uploaded reference photos are stored locally in `backend/media/`.
-- The Gemini key and Cloudflare credentials are used server-side and must never be committed.
-- An AI request failure should be surfaced as an error, not replaced with fabricated AI output.
-- This application has no social-platform publishing integration.
+## Scope and Limitations
 
-## Security and Limitations
+- This is a marketing **draft creation** tool, not a social-media scheduler or automatic publisher.
+- Generated copy and images require human review, particularly for factual claims and accurate product depiction.
+- Gemini and Cloudflare requests may fail due to rate limits (`429`), provider overload (`503`), or exhausted quotas.
+- The prototype is not designed as an authenticated, multi-tenant SaaS product. Production use would require authentication, per-user authorization, abuse prevention, database migrations, additional monitoring, and security review.
+- The agent's approval gate applies to its workflow; standalone creative-generation controls can generate assets independently.
 
-- Do not commit `.env`, `*.db`, uploaded images, or `.venv` to Git.
-- Rotate any credentials accidentally exposed in screenshots, logs, or a repository.
-- Generated content and images require human review for factual accuracy and visual fidelity.
-- Add authentication, authorization, secure media storage, database migrations, API rate limiting, and restricted diagnostic endpoints before public deployment.
-- The approval checkpoint controls the **agent workflow**; independent Phase 3 image-generation actions are separate controls.
-- Free API quotas can return `429 RESOURCE_EXHAUSTED`; transient provider overload can return `503`.
+## Internship Demonstration Evidence
 
-## Suggested Submission Evidence
-
-- Campaign brief and generated strategy
-- Three structured platform-specific content variations
-- Three visual concepts and at least one rendered image
-- Agent in `awaiting_approval` state, before image generation
-- Agent after Approve & Continue (`completed`) and a separate rejected run
-- Campaign history and saved agent runs
-- Backend API health check and frontend build output
+Recommended materials for submission: live frontend URL, backend health check, a saved campaign strategy, three content variations, creative concepts and images, Supabase Storage proof, an agent paused for approval, a completed run, campaign history after refresh, and mobile layout screenshots.
 
 ## Credits
 
-Developed as a **Big Brains Generative AI Internship** full-stack project.
+Developed for the **Big Brains Generative AI Internship**.
